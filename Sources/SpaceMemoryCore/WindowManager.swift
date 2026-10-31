@@ -46,6 +46,8 @@ final class WindowManager {
         let visible: CGRect
         var main: AXWindow
         var cardsReady = false
+        /// Kept running so the main window has a frame ready and can dock as soon as it's switched away from.
+        var mainCapture: WindowCapture?
         var initialDockingDone = false
         var needsCentering = true
         /// The main window's focused frame, set while in full view.
@@ -641,10 +643,19 @@ final class WindowManager {
     }
 
     /// Keeps the preview up until the real window has redrawn underneath it.
-    private func closeAfterRedraw(_ entry: ManagedEntry) {
+    private func closeAfterRedraw(_ entry: ManagedEntry, keepingCapture: Bool = false) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
             entry.preview.close()
-            entry.capture.stop()
+            if !keepingCapture { entry.capture.stop() }
+        }
+    }
+
+    /// Makes a capture the one kept ready for the main window.
+    private func keepReady(_ capture: WindowCapture) {
+        focus?.mainCapture = capture
+        capture.setQuality(.card)
+        capture.onStopped = { [weak self, weak capture] in
+            if let self, self.focus?.mainCapture === capture { self.focus?.mainCapture = nil }
         }
     }
 
@@ -684,6 +695,7 @@ final class WindowManager {
 
     private func followFocus() {
         guard let session = focus, session.cardsReady, switcher == nil, canSwitchNow else { return }
+        if let size = session.main.size { session.mainCapture?.updateSize(size) }
         if session.main.frame == nil, let next = switcherCandidates().first {
             Log.write("switch: main window closed")
             promote(next.window)
@@ -718,6 +730,7 @@ final class WindowManager {
 
         let old = session.main
         let oldFrame = old.frame
+        let oldCapture = session.mainCapture
         let wasFullView = session.frameBeforeFullView != nil
         if let focused = session.frameBeforeFullView ?? oldFrame { session.focusedFrames[old.id] = focused }
         session.recent.removeAll { $0 == old.id || $0 == window.id }
@@ -737,20 +750,34 @@ final class WindowManager {
             entry.capture.onStopped = nil
             entries.removeAll { $0 === entry }
             layOutCards()
-            closeAfterRedraw(entry)
+            closeAfterRedraw(entry, keepingCapture: true)
+            keepReady(entry.capture)
+        } else {
+            let capture = WindowCapture(windowID: window.id, size: size)
+            capture.setQuality(.card)
+            capture.start()
+            keepReady(capture)
+        }
+        // Docked first, because moving the new window can block on a slow app.
+        // A native full-screen window can't be parked.
+        if let oldFrame, !old.isFullScreen, !entries.contains(where: { $0.window.id == old.id }) {
+            let capture = oldCapture ?? WindowCapture(windowID: old.id, size: oldFrame.size)
+            capture.onStopped = nil
+            capture.updateSize(oldFrame.size)
+            if oldCapture == nil {
+                capture.setQuality(.card)
+                capture.start()
+            }
+            dockWhenReady([PendingCard(window: old, frame: oldFrame, capture: capture, preferredEdge: preferredEdge)],
+                          sessionID: session.id, started: ProcessInfo.processInfo.systemUptime,
+                          deadline: Date().addingTimeInterval(3), settlesMain: false)
+        } else {
+            oldCapture?.stop()
         }
         window.setFrame(wasFullView ? session.visible : target)
         window.raise()
 
-        // A native full-screen window can't be parked.
-        if let oldFrame, !old.isFullScreen, !entries.contains(where: { $0.window.id == old.id }) {
-            let capture = WindowCapture(windowID: old.id, size: oldFrame.size)
-            capture.setQuality(.card)
-            capture.start()
-            dockWhenReady([PendingCard(window: old, frame: oldFrame, capture: capture, preferredEdge: preferredEdge)],
-                          sessionID: session.id, started: ProcessInfo.processInfo.systemUptime,
-                          deadline: Date().addingTimeInterval(3))
-        }
+        settleMainWindow()
         updateCoveredColumns()
     }
 
@@ -865,6 +892,11 @@ final class WindowManager {
         var session = FocusSession(visible: visible, main: main)
         session.focusedFrames[main.id] = originalFrame
         focus = session
+        let listing = WindowCapture.listWindows()
+        let mainCapture = WindowCapture(windowID: main.id, size: originalFrame.size)
+        mainCapture.setQuality(.card)
+        mainCapture.start(listing: listing)
+        keepReady(mainCapture)
 
         let managed = Set(entries.map(\.window.id))
         let others = AXWindow.allOnScreen().compactMap { window -> (window: AXWindow, frame: CGRect)? in
@@ -874,7 +906,6 @@ final class WindowManager {
         }
         Log.write("focus: starting with \(main.appName), \(others.count) other window(s)")
 
-        let listing = WindowCapture.listWindows()
         // Reversed so the frontmost window ends up as the top card.
         let pending = others.reversed().map { other -> PendingCard in
             let capture = WindowCapture(windowID: other.window.id, size: other.frame.size)
@@ -891,7 +922,8 @@ final class WindowManager {
     }
 
     /// Docks each window once its preview has a first frame.
-    private func dockWhenReady(_ pending: [PendingCard], sessionID: UUID, started: TimeInterval, deadline: Date) {
+    private func dockWhenReady(_ pending: [PendingCard], sessionID: UUID, started: TimeInterval, deadline: Date,
+                               settlesMain: Bool = true) {
         guard let session = focus, session.id == sessionID else {
             pending.forEach { $0.capture.stop() }
             return
@@ -919,7 +951,7 @@ final class WindowManager {
         if !ready.isEmpty {
             layOutCards()
             focus?.cardsReady = true
-            settleMainWindow()
+            if settlesMain { settleMainWindow() }
         }
         if waiting.isEmpty || Date() >= deadline {
             for item in waiting {
@@ -930,7 +962,7 @@ final class WindowManager {
             Log.write("focus: cards done in \(elapsed) ms, \(waiting.count) window(s) left out")
             focus?.cardsReady = true
             focus?.initialDockingDone = true
-            settleMainWindow()
+            if settlesMain { settleMainWindow() }
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
@@ -944,6 +976,7 @@ final class WindowManager {
             active.timer.invalidate()
             switcher = nil
         }
+        session.mainCapture?.stop()
         focus = nil
         ignoredFocusID = nil
         let returning = entries.filter { $0.fromFocusMode && $0.dockEdge != nil }
@@ -1017,6 +1050,7 @@ final class WindowManager {
 
     func restoreEverything() {
         let session = focus
+        session?.mainCapture?.stop()
         focus = nil
         for entry in entries {
             entry.dockEdge = nil

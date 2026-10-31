@@ -93,7 +93,7 @@ To change the shortcut, choose **Change Shortcut…** in the menu bar. Quitting 
 
 ## How it works
 
-macOS doesn't let an app scale another app's window. A card is a floating panel showing a ScreenCaptureKit stream of the window, and the real window is parked at the bottom-right corner of the desktop.
+macOS doesn't let an app scale another app's window. A card is a floating panel showing a ScreenCaptureKit stream of the window, and the real window is parked at the bottom-right corner of the desktop. The main window's stream keeps running, so it can dock as soon as you switch away.
 
 | File in `Sources/` | Purpose |
 | --- | --- |

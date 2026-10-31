@@ -1,13 +1,12 @@
 import AppKit
 import ScreenCaptureKit
 
-/// A live ScreenCaptureKit feed of one window, drawn into a layer.
+/// A live ScreenCaptureKit feed of one window, drawn into any number of layers.
 final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
     enum Quality { case full, card, deckCard }
 
     let windowID: CGWindowID
-    let size: CGSize
-    let layer = CALayer()
+    private(set) var size: CGSize
 
     private(set) var frameCount = 0
     var hasFrame: Bool { frameCount > 0 }
@@ -17,17 +16,27 @@ final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
     private var quality = Quality.full
     private var stopped = false
     private var latestSample: CMSampleBuffer?
+    private var latestSurface: IOSurfaceRef?
+    private let layers = NSHashTable<CALayer>.weakObjects()
     private let frameQueue = DispatchQueue(label: "capture-frames", qos: .userInteractive)
 
     init(windowID: CGWindowID, size: CGSize) {
         self.windowID = windowID
         self.size = size
         super.init()
+    }
+
+    /// A layer showing this feed, starting with the newest frame if there is one.
+    func makeLayer() -> CALayer {
+        let layer = CALayer()
         layer.backgroundColor = NSColor.windowBackgroundColor.cgColor
         layer.contentsGravity = .resize
         layer.cornerRadius = 10
         layer.masksToBounds = true
         layer.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
+        layer.contents = latestSurface
+        layers.add(layer)
+        return layer
     }
 
     /// Listing the windows is slow, so captures started together should share one listing.
@@ -72,6 +81,14 @@ final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
         }
     }
 
+    func updateSize(_ newSize: CGSize) {
+        guard abs(newSize.width - size.width) >= 1 || abs(newSize.height - size.height) >= 1 else { return }
+        size = newSize
+        stream?.updateConfiguration(configuration(for: quality)) { error in
+            if let error { Log.write("capture: resize failed: \(error.localizedDescription)") }
+        }
+    }
+
     func stop() {
         stopped = true
         stream?.stopCapture { _ in }
@@ -113,7 +130,8 @@ final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
             frameCount += 1
             // Retained so ScreenCaptureKit doesn't recycle the surface while it's displayed.
             latestSample = sampleBuffer
-            layer.contents = surface
+            latestSurface = surface
+            layers.allObjects.forEach { $0.contents = surface }
         }
     }
 
@@ -162,7 +180,7 @@ final class PreviewPanel {
         container.layer?.borderColor = NSColor.white.withAlphaComponent(0.22).cgColor
 
         let preview = NSView(frame: initial)
-        preview.layer = capture.layer
+        preview.layer = capture.makeLayer()
         preview.wantsLayer = true
         preview.autoresizingMask = [.width, .height]
         container.addSubview(preview)

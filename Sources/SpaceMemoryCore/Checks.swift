@@ -260,6 +260,29 @@ enum Checks {
         report("[switch] \(step): main \(main.appName) \(main.id) \(frame), has focus \(front?.id == main.id), main is a card \(managed.contains(main.id)), other windows visible \(others.map(\.appName)), cards over it \(overlapping), cards \(manager.dockedCount)")
     }
 
+    /// Switches to the last-used window, then measures how long the previous one takes to become a parked card.
+    @MainActor
+    private static func reportDockTime(_ manager: WindowManager, step: String) async {
+        guard let previous = manager.focusedMainWindow else { return }
+        postModifier(58, down: true, flags: .maskAlternate)
+        await sleep(0.05)
+        press(48, .maskAlternate)
+        await sleep(0.1)
+        postModifier(58, down: false, flags: [])
+        let started = ProcessInfo.processInfo.systemUptime
+        var elapsed: Int?
+        while ProcessInfo.processInfo.systemUptime - started < 1.5 {
+            let isCard = manager.entries.contains { $0.window.id == previous.id && $0.dockEdge != nil }
+            if isCard, manager.focusedMainWindow?.id != previous.id {
+                elapsed = Int((ProcessInfo.processInfo.systemUptime - started) * 1000)
+                break
+            }
+            await sleep(0.005)
+        }
+        report("[switch] dock time \(step): \(elapsed.map { "\($0) ms" } ?? "not docked within 1.5 s")")
+        await sleep(0.6)
+    }
+
     @MainActor
     static func runSwitchingChecks(manager: WindowManager, appNames: [String]) async {
         report("=== switching checks ===")
@@ -294,6 +317,18 @@ enum Checks {
         await sleep(1.2)
         report("[switch] ⌘Tab changed the main window: \(manager.focusedMainWindow?.id != afterActivate), now \(manager.focusedMainWindow?.appName ?? "?")")
         reportFocusArea(manager, "⌘Tab")
+
+        // This card's stream has been through two handoffs, so it must still be live.
+        if let card = manager.entries.first(where: { $0.window.appName == other }) {
+            let a = card.capture.latestFrameImage()
+            let framesBefore = card.capture.frameCount
+            await sleep(1.5)
+            let b = card.capture.latestFrameImage()
+            report("[switch] reused stream on \(other) card: frames \(card.capture.frameCount - framesBefore), content changed \(!sameImage(a, b))")
+        } else {
+            report("[switch] FAILED: no \(other) card to check")
+        }
+        await reportDockTime(manager, step: "after ⌘Tab")
 
         // ⌥Tab, held across two presses: selects the second most recent window, then switches on release.
         let beforeSwitcher = manager.focusedMainWindow?.id
@@ -346,6 +381,7 @@ enum Checks {
             await sleep(1.2)
             report("[switch] card clicked: main is that window \(manager.focusedMainWindow?.id == cardID)")
             reportFocusArea(manager, "card click")
+            await reportDockTime(manager, step: "after card click")
         }
 
         // Full view carries across a switch, and each window keeps its own focused size.
@@ -384,6 +420,9 @@ enum Checks {
         }
         await sleep(1.5)
         reportFocusArea(manager, "rapid switching")
+        let visibleCards = manager.entries.filter { $0.dockEdge != nil }
+        let duplicates = visibleCards.count - Set(visibleCards.map(\.window.id)).count
+        report("[switch] rapid switching: duplicate cards \(duplicates), main is a card \(visibleCards.contains { $0.window.id == manager.focusedMainWindow?.id })")
 
         manager.exitFocus()
         await sleep(1.2)
@@ -771,7 +810,8 @@ enum Checks {
         let leftCount = cards.filter { $0.dockEdge == .left }.count
         let column = cards.filter { $0.dockEdge == (leftCount > cards.count - leftCount ? .left : .right) }
         if column.count >= 2 {
-            let target = column[column.count / 2]
+            // Another app's card could become the main window, and pressing its title bar may hit a button.
+            let target = column.first { $0.window.pid == window.pid } ?? column[column.count / 2]
             let point = CGPoint(x: target.hitRect.midX, y: target.hitRect.midY)
             post(.mouseMoved, point)
             await sleep(0.4)
@@ -791,6 +831,12 @@ enum Checks {
         let othersBack = before.allSatisfy { other, original in
             guard let now = other.frame else { return true }
             return abs(now.minX - original.minX) < 2 && abs(now.minY - original.minY) < 2
+        }
+        let shakeEnded = !manager.isFocusMode
+        if !shakeEnded {
+            report("[focus] FAILED: second shake didn't end focus mode")
+            manager.exitFocus()
+            await sleep(1.2)
         }
         let mainBack = window.frame == frame
         report("[focus] second shake: active \(manager.isFocusMode), others back \(othersBack), main back \(mainBack) (\(window.frame ?? .zero))")
