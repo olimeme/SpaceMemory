@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SpaceMemory drag test</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+  body { display: grid; place-items: center; background: #1d3557; font: 600 32px -apple-system, sans-serif; color: #fff; }
+  #source { width: 70vw; height: 70vh; display: grid; place-items: center; background: #e76f51; border-radius: 16px; cursor: grab; user-select: none; }
+</style>
+<div id="source" draggable="true">Drag this</div>
+<script>
+  document.getElementById("source").addEventListener("dragstart", (event) => {
+    event.dataTransfer.setData("text/plain", "SpaceMemory drag payload ");
+  });
+</script>
