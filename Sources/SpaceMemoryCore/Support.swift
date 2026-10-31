@@ -1,6 +1,6 @@
 import AppKit
 
-/// Appends to ~/Library/Logs/SpaceMemory.log so runs can be inspected after the fact.
+/// Appends to ~/Library/Logs/SpaceMemory.log.
 enum Log {
     static let url = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Logs/SpaceMemory.log")
@@ -28,7 +28,7 @@ enum Log {
 
 enum Edge: String { case left, right }
 
-/// All geometry uses global top-left coordinates, the system CGEvent and the Accessibility API share.
+/// Geometry uses global top-left coordinates, like CGEvent and the Accessibility API.
 enum Screens {
     private static var primaryHeight: CGFloat { NSScreen.screens.first?.frame.height ?? 0 }
 
@@ -50,8 +50,7 @@ enum Screens {
         NSScreen.screens.first { topLeftFrame(of: $0).contains(point) } ?? NSScreen.main
     }
 
-    /// The bottom-right corner of the whole desktop. macOS keeps a window's title bar on screen, so
-    /// what remains visible is a strip one point wide and about one title bar tall.
+    /// The desktop's bottom-right corner. macOS keeps a thin strip of the window on screen.
     static var parkingOrigin: CGPoint {
         let union = NSScreen.screens.map(topLeftFrame).reduce(CGRect.null) { $0.union($1) }
         return CGPoint(x: union.maxX - 1, y: union.maxY - 1)
@@ -62,7 +61,7 @@ enum Screens {
     }
 }
 
-/// The side zones of a screen: the band where windows shrink, and the outer part where they dock.
+/// A screen's side zones, where dragged windows shrink.
 struct Zones {
     let visible: CGRect
     let bandWidth: CGFloat
@@ -74,27 +73,25 @@ struct Zones {
         dockWidth = max(110, visible.width * 0.05)
     }
 
-    /// How far into the band a drag must go before shrinking begins, so that a shake near the edge
-    /// of a large window isn't mistaken for a move toward the side.
+    /// A margin so that shaking a large window isn't mistaken for dragging it to the side.
     private let shrinkStart: CGFloat = 0.15
 
-    /// 0 until a drag is clearly heading for the side, rising to 1 in the dock area.
     func shrinkProgress(atX x: CGFloat) -> CGFloat {
         max(0, (progress(atX: x) - shrinkStart) / (1 - shrinkStart))
     }
 
     func nearestEdge(to x: CGFloat) -> Edge { x - visible.minX < visible.maxX - x ? .left : .right }
 
-    /// 0 in the working area, rising to 1 once the cursor reaches the dock area.
+    /// 0 outside the side zone, rising to 1 near the edge.
     func progress(atX x: CGFloat) -> CGFloat {
         let distance = min(x - visible.minX, visible.maxX - x)
         return min(1, max(0, (bandWidth - distance) / (bandWidth - dockWidth)))
     }
 }
 
-let widgetWidth: CGFloat = 240
-let widgetMaxHeight: CGFloat = 170
+let cardWidth: CGFloat = 240
+let cardMaxHeight: CGFloat = 170
 
-func widgetScale(for size: CGSize) -> CGFloat {
-    min(1, widgetWidth / size.width, widgetMaxHeight / size.height)
+func cardScale(for size: CGSize) -> CGFloat {
+    min(1, cardWidth / size.width, cardMaxHeight / size.height)
 }

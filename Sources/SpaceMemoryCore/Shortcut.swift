@@ -28,8 +28,7 @@ struct Shortcut: Codable, Equatable {
         kVK_LeftArrow: "←", kVK_RightArrow: "→", kVK_UpArrow: "↑", kVK_DownArrow: "↓",
     ]
 
-    /// Shortcuts are tied to the physical key, so the label shouldn't change with the active layout:
-    /// with a Cyrillic layout on, the J key would otherwise read as О.
+    /// Shortcuts use the physical key, so labels come from the Latin layout whatever layout is active.
     private static func latinLabel(forKeyCode keyCode: UInt16) -> String? {
         guard let source = TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
               let property = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return nil }
@@ -52,7 +51,7 @@ struct Shortcut: Codable, Equatable {
         case invalid(String)
     }
 
-    /// One modifier isn't enough: combinations like ⌘C or ⌥E belong to apps and to typing.
+    /// Requires two modifiers or a function key, since combinations like ⌘C belong to apps.
     static func validate(_ event: NSEvent) -> Validation {
         let flags = event.modifierFlags
         var modifiers: UInt32 = 0
@@ -73,7 +72,7 @@ struct Shortcut: Codable, Equatable {
     }
 }
 
-/// Owns the global shortcut: saving it, registering it, and the window for changing it.
+/// Saves and registers the global shortcuts, and shows the window for changing them.
 final class ShortcutController: NSObject, NSWindowDelegate {
     private static let defaultsKey = "fullViewShortcut"
 
@@ -123,8 +122,8 @@ final class ShortcutController: NSObject, NSWindowDelegate {
         Log.write("shortcut: \(current.displayName) registered with status \(status)")
     }
 
-    /// A Carbon hot key sees only this one key combination, unlike an event tap on the whole keyboard.
-    /// Two apps can hold the same combination and both fire: plain ⌃⌥F is Rectangle's Center Third.
+    /// Uses a Carbon hot key to avoid monitoring the whole keyboard. macOS doesn't report clashes with
+    /// other apps, and both respond. For example, Rectangle's Center Third uses ⌃⌥F.
     private func register(_ shortcut: Shortcut) -> OSStatus {
         unregister()
         return RegisterEventHotKey(shortcut.keyCode, shortcut.carbonModifiers,
@@ -132,7 +131,7 @@ final class ShortcutController: NSObject, NSWindowDelegate {
                                    GetApplicationEventTarget(), 0, &hotKey)
     }
 
-    /// ⌥Tab, held only during focus mode, so it stays available to other apps the rest of the time.
+    /// ⌥Tab is only registered during focus mode.
     func setSwitcherEnabled(_ enabled: Bool) {
         if let switcherHotKey { UnregisterEventHotKey(switcherHotKey) }
         switcherHotKey = nil
@@ -171,7 +170,7 @@ final class ShortcutController: NSObject, NSWindowDelegate {
             return
         }
         previousApp = NSWorkspace.shared.frontmostApplication
-        // Released while recording, or pressing the current shortcut would toggle instead of being captured.
+        // Unregistered so pressing the current shortcut gets recorded.
         unregister()
 
         let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 380, height: 150),

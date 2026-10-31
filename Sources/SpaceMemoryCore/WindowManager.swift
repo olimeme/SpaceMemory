@@ -1,6 +1,6 @@
 import AppKit
 
-/// A window currently represented by a preview: being dragged as one, or docked on an edge.
+/// A window shown as a preview, either mid-drag or docked.
 final class ManagedEntry {
     let window: AXWindow
     let size: CGSize
@@ -11,11 +11,10 @@ final class ManagedEntry {
     var dockEdge: Edge?
     var dockScreenFrame: CGRect = .zero
     var fromFocusMode = false
-    /// Where the card rests in its column.
     var slotFrame: CGRect = .zero
-    /// The part of the card the cursor can reach: only its top strip when it's in a deck.
+    /// The clickable part of the card. In a deck, this is its visible strip.
     var hitRect: CGRect = .zero
-    var restingQuality = WindowCapture.Quality.widget
+    var restingQuality = WindowCapture.Quality.card
 
     init(window: AXWindow, size: CGSize, originalOrigin: CGPoint, capture: WindowCapture) {
         self.window = window
@@ -32,33 +31,30 @@ final class WindowManager {
         case pressed(window: AXWindow, frame: CGRect, press: CGPoint)
         case nativeDrag(window: AXWindow, frame: CGRect, grab: CGPoint, capture: WindowCapture)
         case proxyDrag(entry: ManagedEntry, grab: CGPoint)
-        case widgetPress(entry: ManagedEntry, press: CGPoint)
+        case cardPress(entry: ManagedEntry, press: CGPoint)
     }
 
-    private struct PendingWidget {
+    private struct PendingCard {
         let window: AXWindow
         let frame: CGRect
         let capture: WindowCapture
         var preferredEdge: Edge?
     }
 
-    /// Focus mode: exactly one window in the middle, every other window a widget on the edges.
     private struct FocusSession {
         let id = UUID()
         let visible: CGRect
         var main: AXWindow
-        var widgetsReady = false
-        /// The window that starts a session is centered once the first widgets have all docked.
+        var cardsReady = false
         var initialDockingDone = false
         var needsCentering = true
-        /// Set while in full view: where to return the main window when going back to focused.
+        /// The main window's focused frame, set while in full view.
         var frameBeforeFullView: CGRect?
-        /// Every window the session has touched, oldest first, and where it goes when the session ends.
+        /// Where each window returns when the session ends.
         var originals: [(window: AXWindow, frame: CGRect)] = []
-        /// The size each window had in the focus area, for when it comes back there.
         var focusedFrames: [CGWindowID: CGRect] = [:]
         var edges: [CGWindowID: Edge] = [:]
-        /// Windows that were recently in the focus area, most recent first.
+        /// Most recent first.
         var recent: [CGWindowID] = []
 
         mutating func remember(_ window: AXWindow, frame: CGRect) {
@@ -71,9 +67,9 @@ final class WindowManager {
         }
     }
 
-    private let widgetMargin: CGFloat = 10
+    private let cardMargin: CGFloat = 10
 
-    let tap = EventTap()
+    private let tap = EventTap()
     private var phase = Phase.idle
     private var shake = ShakeDetector()
     private(set) var entries: [ManagedEntry] = []
@@ -83,27 +79,25 @@ final class WindowManager {
         }
     }
     var onFocusModeChanged: ((Bool) -> Void)?
-    /// The ⌥Tab switcher while ⌥ is held: the selected card is lifted, and releasing switches to it.
+    /// Set while ⌥ is held after ⌥Tab.
     private var switcher: (candidates: [ManagedEntry], index: Int, timer: Timer)?
-    /// Clicking the desktop activates Finder, which shouldn't pull a Finder window into the focus area.
+    /// Clicking the desktop activates Finder, which must not promote a Finder window.
     private var lastDesktopPress: TimeInterval = 0
     private var ignoredFocusID: CGWindowID?
-    /// A drag of content, like a file or a piece of text, as opposed to a window or a card.
+    /// True while dragging a file, text or image, as opposed to a window or card.
     private(set) var isContentDragging = false
     private var dragPasteboardCount = 0
-    private var springCard: ManagedEntry?
-    private var springCardSince: TimeInterval = 0
-    /// Off after a card opens, until the cursor leaves the cards: the layout has just shifted under it.
-    private var springArmed = true
-    /// The main window can't be resized under the user's hand, so this waits for the button release.
+    private var heldCard: ManagedEntry?
+    private var heldCardSince: TimeInterval = 0
+    /// Off after a held card opens, until the cursor leaves the cards.
+    private var holdArmed = true
+    /// Applied on mouse release, since a window can't be resized mid-drag.
     private var pendingMainRestore: (window: AXWindow, frame: CGRect)?
     private var hovered: ManagedEntry?
     private var lastShakeTime: TimeInterval = 0
-    /// Columns the front window is covering. They stay off screen until revealed from the edge.
     private var coveredColumns: Set<String> = []
     private var revealedColumn: String?
-    /// A card just dropped on the edge stays in view until the cursor leaves its column, even if a
-    /// large window comes to the front and covers it. Otherwise it would seem to vanish.
+    /// Keeps a just-dropped card visible until the cursor leaves its column.
     private var isHoldingDroppedColumn = false
     private var cursorAtEdgeSince: (column: String, time: TimeInterval)?
     private var ticksOutsideRevealedColumn = 0
@@ -141,7 +135,7 @@ final class WindowManager {
     private func handle(_ kind: EventTap.Kind, _ point: CGPoint, _ time: TimeInterval) {
         switch kind {
         case .down: pressed(at: point)
-        case .widgetDown: widgetPressed(at: point)
+        case .cardDown: cardPressed(at: point)
         case .dragged: dragged(to: point, time: time)
         case .up: released(at: point)
         case .moved: cursorMoved(to: point)
@@ -154,12 +148,10 @@ final class WindowManager {
         dragPasteboardCount = NSPasteboard(name: .drag).changeCount
         guard let window = AXWindow.at(point), let frame = window.frame,
               !entries.contains(where: { $0.window.id == window.id }) else {
-            Log.write("press: no manageable window at \(point)")
             lastDesktopPress = ProcessInfo.processInfo.systemUptime
             phase = .idle
             return
         }
-        Log.write("press: \(window.appName) window \(window.id) at \(point)")
         phase = .pressed(window: window, frame: frame, press: point)
     }
 
@@ -173,7 +165,7 @@ final class WindowManager {
             guard let current = window.frame else { return }
             let moved = abs(current.minX - frame.minX) >= 2 || abs(current.minY - frame.minY) >= 2
             guard moved, current.size == frame.size else { return }
-            // Capture starts as the drag does, so a frame is ready before the window reaches a side zone.
+            // Started early so a frame is ready when the window reaches a side zone.
             let capture = WindowCapture(windowID: window.id, size: frame.size)
             capture.start()
             let grab = CGPoint(x: press.x - frame.minX, y: press.y - frame.minY)
@@ -185,7 +177,6 @@ final class WindowManager {
                 shakeTriggered(on: window, frameBeforeDrag: frame)
                 lastShakeTime = time
             }
-            // Shaking near a side zone must not count as moving the window into it.
             guard time - lastShakeTime > 0.4, !shake.mightBeShaking(at: time),
                   let screen = Screens.screen(at: point),
                   Zones(screen: screen).shrinkProgress(atX: point.x) > 0 else { return }
@@ -195,9 +186,9 @@ final class WindowManager {
         case let .proxyDrag(entry, grab):
             place(entry, cursor: point, grab: grab)
 
-        case let .widgetPress(entry, press):
+        case let .cardPress(entry, press):
             guard hypot(point.x - press.x, point.y - press.y) > 5 else { return }
-            startDraggingWidget(entry, press: press, cursor: point)
+            startDraggingCard(entry, press: press, cursor: point)
         }
     }
 
@@ -210,11 +201,11 @@ final class WindowManager {
         case let .nativeDrag(window, _, _, capture):
             capture.stop()
             finishedDragOfMain = window.id == focus?.main.id || window.id == pendingMainRestore?.window.id
-            // Dragging a full-view window is how you pull it back out of full view.
+            // Dragging a full-view window returns it to focused view.
             if window.id == focus?.main.id { focus?.frameBeforeFullView = nil }
         case let .proxyDrag(entry, grab):
             finishProxyDrag(entry, cursor: point, grab: grab)
-        case let .widgetPress(entry, _):
+        case let .cardPress(entry, _):
             if focus != nil {
                 phase = .idle
                 promote(entry.window)
@@ -234,8 +225,7 @@ final class WindowManager {
 
     // MARK: Dragging content between windows
 
-    /// Returns true while content is being dragged. The system writes to the drag pasteboard when a
-    /// drag starts, which is what tells it apart from selecting text.
+    /// Returns true during a content drag. A drag writes to the drag pasteboard; selecting text doesn't.
     private func trackContentDrag(at point: CGPoint, time: TimeInterval) -> Bool {
         switch phase {
         case .idle, .pressed: break
@@ -244,27 +234,26 @@ final class WindowManager {
         if !isContentDragging {
             guard NSPasteboard(name: .drag).changeCount != dragPasteboardCount else { return false }
             isContentDragging = true
-            springArmed = true
+            holdArmed = true
             entries.forEach { $0.preview.setRefusesDrops(true) }
             Log.write("content drag: started")
         }
         guard switcher == nil else { return true }
         let target = card(at: point)
-        if target == nil { springArmed = true }
-        if target !== springCard {
-            springCard = target
-            springCardSince = time
-            setHovered(springArmed ? target : nil)
+        if target == nil { holdArmed = true }
+        if target !== heldCard {
+            heldCard = target
+            heldCardSince = time
+            setHovered(holdArmed ? target : nil)
         }
         return true
     }
 
-    /// The Dock's trick for dragging into hidden windows: hold over a card, and its window opens.
-    private func updateSpringCard() {
-        guard let card = springCard, springArmed, focus != nil,
-              ProcessInfo.processInfo.systemUptime - springCardSince >= 0.45 else { return }
-        springCard = nil
-        springArmed = false
+    private func openHeldCard() {
+        guard let card = heldCard, holdArmed, focus != nil,
+              ProcessInfo.processInfo.systemUptime - heldCardSince >= 0.45 else { return }
+        heldCard = nil
+        holdArmed = false
         setHovered(nil)
         Log.write("content drag: opening \(card.window.appName) window \(card.window.id)")
         promote(card.window)
@@ -273,7 +262,7 @@ final class WindowManager {
     private func endContentDrag() {
         guard isContentDragging else { return }
         isContentDragging = false
-        springCard = nil
+        heldCard = nil
         setHovered(nil)
         entries.forEach { $0.preview.setRefusesDrops(false) }
         Log.write("content drag: ended")
@@ -282,7 +271,7 @@ final class WindowManager {
     // MARK: Native drag to preview
 
     private func takeOver(window: AXWindow, frame: CGRect, grab: CGPoint, capture: WindowCapture, at point: CGPoint) {
-        // The button may already be up with its release still queued behind this event.
+        // The release may still be queued behind this event.
         guard CGEventSource.buttonState(.combinedSessionState, button: .left) else { return }
 
         let entry = makeEntry(window: window, frame: frame, capture: capture)
@@ -296,7 +285,7 @@ final class WindowManager {
         phase = .proxyDrag(entry: entry, grab: grab)
         Log.write("swap: took over \(window.appName) window \(window.id)")
 
-        // The app needs a moment to see the mouse-up, or it may fight the move.
+        // Gives the app time to process the mouse-up before the window moves.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self, weak entry] in
             guard let entry else { return }
             self?.park(entry, attempt: 1, started: started)
@@ -326,7 +315,6 @@ final class WindowManager {
             } else {
                 Log.write("swap: FAILED to park \(entry.window.appName), window at \(origin)")
                 if entry.fromFocusMode {
-                    // It can't be hidden, so a widget would only be a duplicate of it.
                     entry.capture.onStopped = nil
                     entry.capture.stop()
                     self.windowDisappeared(entry)
@@ -339,7 +327,7 @@ final class WindowManager {
         guard let screen = Screens.screen(at: cursor) else { return }
         let progress = Zones(screen: screen).shrinkProgress(atX: cursor.x)
         let eased = 1 - (1 - progress) * (1 - progress)
-        let scale = 1 + (widgetScale(for: entry.size) - 1) * eased
+        let scale = 1 + (cardScale(for: entry.size) - 1) * eased
         let frame = CGRect(x: cursor.x - grab.x * scale, y: cursor.y - grab.y * scale,
                            width: entry.size.width * scale, height: entry.size.height * scale)
         entry.preview.setFrame(frame)
@@ -353,11 +341,10 @@ final class WindowManager {
             revealedColumn = columnKey(of: entry)
             isHoldingDroppedColumn = true
             ticksOutsideRevealedColumn = 0
-            layOutWidgets()
+            layOutCards()
             if focus == nil {
                 focusFrontmostWindow()
             } else if entry.window.id == focus?.main.id, let next = switcherCandidates().first(where: { $0 !== entry }) {
-                // The focus area is never left empty while there's a window to put in it.
                 promote(next.window)
             }
         } else if focus != nil, entry.window.id != focus?.main.id {
@@ -368,12 +355,12 @@ final class WindowManager {
         }
     }
 
-    // MARK: Widgets and decks
+    // MARK: Cards and decks
 
     private func dock(_ entry: ManagedEntry, edge: Edge, screenFrame: CGRect) {
         entry.dockEdge = edge
         entry.dockScreenFrame = screenFrame
-        entry.capture.setQuality(.widget)
+        entry.capture.setQuality(.card)
         let title = entry.window.title
         entry.preview.setHeader(title: title.isEmpty ? entry.window.appName : title,
                                 icon: NSRunningApplication(processIdentifier: entry.window.pid)?.icon)
@@ -385,10 +372,10 @@ final class WindowManager {
     private func undock(_ entry: ManagedEntry) {
         entry.dockEdge = nil
         entry.preview.showHeader(false)
-        layOutWidgets()
+        layOutCards()
     }
 
-    private func layOutWidgets() {
+    private func layOutCards() {
         hovered = nil
         var columns: [String: [ManagedEntry]] = [:]
         var columnOrder: [String] = []
@@ -398,7 +385,7 @@ final class WindowManager {
             columns[key, default: []].append(entry)
         }
         for key in columnOrder { layOutColumn(columns[key] ?? [], isHidden: isColumnHidden(key)) }
-        updateWidgetHitAreas()
+        updateCardHitAreas()
     }
 
     private func columnKey(of entry: ManagedEntry) -> String? {
@@ -411,41 +398,38 @@ final class WindowManager {
         coveredColumns.contains(key) && key != revealedColumn
     }
 
-    /// Hidden cards must not catch clicks, which belong to the window that's covering them.
-    private func updateWidgetHitAreas() {
-        tap.setWidgetFrames(entries.filter { entry in
+    private func updateCardHitAreas() {
+        tap.setCardFrames(entries.filter { entry in
             columnKey(of: entry).map { !isColumnHidden($0) } ?? false
         }.map(\.hitRect))
     }
 
-    /// Cards sit in a plain column while they fit. Beyond that they overlap like a deck: each one
-    /// shows its top strip, and the last shows in full.
+    /// Stacks cards in a column, overlapping them into a deck if they don't fit.
     private func layOutColumn(_ column: [ManagedEntry], isHidden: Bool) {
         guard let first = column.first, let edge = first.dockEdge, let last = column.last else { return }
         let screen = first.dockScreenFrame
-        let available = screen.height - 2 * widgetMargin
+        let available = screen.height - 2 * cardMargin
         let sizes = column.map { cardSize(for: $0) }
-        let naturalHeight = sizes.map(\.height).reduce(0, +) + CGFloat(column.count - 1) * widgetMargin
+        let naturalHeight = sizes.map(\.height).reduce(0, +) + CGFloat(column.count - 1) * cardMargin
         let isDeck = naturalHeight > available
         let lastHeight = sizes[sizes.count - 1].height
         let deckStep = column.count > 1 ? (available - lastHeight) / CGFloat(column.count - 1) : 0
 
-        var y = screen.minY + widgetMargin
+        var y = screen.minY + cardMargin
         for (index, entry) in column.enumerated() {
             let size = sizes[index]
-            let x = edge == .left ? screen.minX + widgetMargin : screen.maxX - size.width - widgetMargin
+            let x = edge == .left ? screen.minX + cardMargin : screen.maxX - size.width - cardMargin
             let frame = CGRect(origin: CGPoint(x: x, y: y), size: size)
-            let step = isDeck ? deckStep : size.height + widgetMargin
+            let step = isDeck ? deckStep : size.height + cardMargin
             let isCovered = isDeck && entry !== last && step < size.height
             entry.slotFrame = frame
             entry.hitRect = isCovered ? CGRect(x: x, y: y, width: size.width, height: step) : frame
-            entry.restingQuality = isCovered ? .deckCard : .widget
+            entry.restingQuality = isCovered ? .deckCard : .card
             y += step
         }
         setColumn(column, hidden: isHidden, animated: false)
     }
 
-    /// Cards take their place at once; only sliding a whole column away or back in is animated.
     private func setColumn(_ column: [ManagedEntry], hidden: Bool, animated: Bool) {
         guard let edge = column.first?.dockEdge, let screen = column.first?.dockScreenFrame else { return }
         for entry in column {
@@ -460,7 +444,7 @@ final class WindowManager {
             }
         }
         if hidden {
-            // Ordered out once clear of the screen, or it would land on any neighbouring display.
+            // Ordered out so an off-screen card can't appear on another display.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in
                 guard let self else { return }
                 for entry in column {
@@ -468,7 +452,6 @@ final class WindowManager {
                 }
             }
         } else {
-            // Later cards lie on top, which leaves the headers of the earlier ones showing.
             column.forEach { $0.preview.show() }
         }
     }
@@ -481,26 +464,25 @@ final class WindowManager {
         }
     }
 
-    // MARK: Hiding columns: the front window wins
+    // MARK: Hiding columns
 
     private func columnTick() {
         if isContentDragging {
-            // A safety net: a missed button release mustn't leave cards refusing drops for good.
+            // In case the tap missed the button release.
             guard CGEventSource.buttonState(.combinedSessionState, button: .left) else {
                 endContentDrag()
                 return
             }
             if switcher == nil {
-                updateSpringCard()
+                openHeldCard()
                 followFocus()
                 updateEdgeReveal()
             }
             return
         }
-        // Changes wait for the mouse: the layout mustn't shift under a drag.
         guard case .idle = phase, switcher == nil else { return }
         ticks += 1
-        // Not every switch activates an app: ⌘` stays within one, so focus has to be watched as well.
+        // ⌘` changes focus without activating an app, so there's no notification for it.
         if focus != nil, ticks % 2 == 0 { followFocus() }
         guard dockedCount > 0 else {
             coveredColumns = []
@@ -515,7 +497,7 @@ final class WindowManager {
 
     private func columnRect(of entry: ManagedEntry) -> CGRect {
         let screen = entry.dockScreenFrame
-        let width = widgetWidth + 2 * widgetMargin
+        let width = cardWidth + 2 * cardMargin
         let x = entry.dockEdge == .left ? screen.minX : screen.maxX - width
         return CGRect(x: x, y: screen.minY, width: width, height: screen.height)
     }
@@ -546,10 +528,9 @@ final class WindowManager {
             let column = entries.filter { columnKey(of: $0) == key }
             setColumn(column, hidden: isColumnHidden(key), animated: true)
         }
-        updateWidgetHitAreas()
+        updateCardHitAreas()
     }
 
-    /// A hidden column comes back when the cursor rests at its screen edge, and leaves with the cursor.
     private func updateEdgeReveal() {
         guard let cursor = CGEvent(source: nil)?.location else { return }
         if let revealed = revealedColumn {
@@ -578,7 +559,7 @@ final class WindowManager {
             cursorAtEdgeSince = (atEdge, now)
             return
         }
-        // A brief pause, so passing a scrollbar at the screen's edge doesn't set it off.
+        // The delay avoids revealing when the cursor passes a scrollbar.
         if now - since.time >= 0.3 {
             cursorAtEdgeSince = nil
             revealedColumn = atEdge
@@ -588,7 +569,7 @@ final class WindowManager {
     }
 
     private func cardSize(for entry: ManagedEntry) -> CGSize {
-        let scale = widgetScale(for: entry.size)
+        let scale = cardScale(for: entry.size)
         return CGSize(width: entry.size.width * scale, height: entry.size.height * scale)
     }
 
@@ -596,8 +577,7 @@ final class WindowManager {
         entries.first { $0.dockEdge != nil && $0.hitRect.contains(point) }
     }
 
-    /// Lifts a card clear of its deck. Selection follows the strips, not the lifted card, so moving
-    /// down the column flips through the cards one by one.
+    /// Lifts a card out of its column. Selection uses hit rects, so the lifted card doesn't block its neighbors.
     private func setHovered(_ entry: ManagedEntry?) {
         guard entry !== hovered else { return }
         if let old = hovered, old.dockEdge != nil {
@@ -610,23 +590,23 @@ final class WindowManager {
         guard let entry, let edge = entry.dockEdge else { return }
         var lifted = entry.slotFrame
         lifted.origin.x += edge == .left ? 14 : -14
-        lifted.origin.y = min(lifted.minY, entry.dockScreenFrame.maxY - widgetMargin - lifted.height)
+        lifted.origin.y = min(lifted.minY, entry.dockScreenFrame.maxY - cardMargin - lifted.height)
         entry.preview.setFrame(lifted, animated: true)
         entry.preview.show()
-        entry.capture.setQuality(.widget)
+        entry.capture.setQuality(.card)
     }
 
-    private func widgetPressed(at point: CGPoint) {
+    private func cardPressed(at point: CGPoint) {
         setHovered(nil)
         guard let entry = card(at: point) else {
             phase = .idle
             return
         }
-        phase = .widgetPress(entry: entry, press: point)
+        phase = .cardPress(entry: entry, press: point)
     }
 
-    private func startDraggingWidget(_ entry: ManagedEntry, press: CGPoint, cursor: CGPoint) {
-        let scale = widgetScale(for: entry.size)
+    private func startDraggingCard(_ entry: ManagedEntry, press: CGPoint, cursor: CGPoint) {
+        let scale = cardScale(for: entry.size)
         let frame = entry.slotFrame
         let grab = CGPoint(x: (press.x - frame.minX) / scale, y: (press.y - frame.minY) / scale)
         undock(entry)
@@ -636,7 +616,7 @@ final class WindowManager {
         phase = .proxyDrag(entry: entry, grab: grab)
     }
 
-    /// Where a clicked widget's window goes: its old place, unless that was itself in a side zone.
+    /// The window's old position, or centered if that was in a side zone.
     private func restoredOrigin(for entry: ManagedEntry) -> CGPoint {
         let center = CGPoint(x: entry.originalOrigin.x + entry.size.width / 2,
                              y: entry.originalOrigin.y + entry.size.height / 2)
@@ -655,20 +635,24 @@ final class WindowManager {
         entry.window.setOrigin(origin)
         entry.window.raise()
         entries.removeAll { $0 === entry }
-        layOutWidgets()
-        // The preview stays up until the real window has had time to redraw underneath it.
+        layOutCards()
+        closeAfterRedraw(entry)
+        Log.write("restore: \(entry.window.appName) to \(origin)")
+    }
+
+    /// Keeps the preview up until the real window has redrawn underneath it.
+    private func closeAfterRedraw(_ entry: ManagedEntry) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
             entry.preview.close()
             entry.capture.stop()
         }
-        Log.write("restore: \(entry.window.appName) to \(origin)")
     }
 
     private func windowDisappeared(_ entry: ManagedEntry) {
         entry.preview.close()
         entries.removeAll { $0 === entry }
-        layOutWidgets()
-        Log.write("widget: removed \(entry.window.appName), its window closed")
+        layOutCards()
+        Log.write("card: removed \(entry.window.appName), its window closed")
     }
 
     private func focusFrontmostWindow() {
@@ -676,8 +660,7 @@ final class WindowManager {
         AXWindow.allOnScreen().first { !managed.contains($0.id) }?.raise()
     }
 
-    /// Cmd-Tab or a Dock click can focus a parked window, which would leave the user typing into
-    /// something invisible, so it comes back.
+    /// Restores a parked window that gains focus, since typing would otherwise go to a hidden window.
     private func applicationActivated(_ pid: pid_t) {
         guard focus == nil else {
             followFocus()
@@ -691,19 +674,16 @@ final class WindowManager {
         restore(entry, to: restoredOrigin(for: entry))
     }
 
-    // MARK: One window in the focus area
+    // MARK: Switching windows
 
-    /// Switching waits while a window or card is being dragged, but it's how content reaches another window.
     private var canSwitchNow: Bool {
         if isContentDragging { return true }
         if case .idle = phase { return true }
         return false
     }
 
-    /// Whichever window has the keyboard focus belongs in the focus area, however it got there.
     private func followFocus() {
-        guard let session = focus, session.widgetsReady, switcher == nil, canSwitchNow else { return }
-        // A closed main window would otherwise leave the focus area empty.
+        guard let session = focus, session.cardsReady, switcher == nil, canSwitchNow else { return }
         if session.main.frame == nil, let next = switcherCandidates().first {
             Log.write("switch: main window closed")
             promote(next.window)
@@ -724,9 +704,9 @@ final class WindowManager {
         promote(front)
     }
 
-    /// Puts a window in the focus area and sends the one that was there to the edge.
+    /// Makes a window the main window and docks the previous one.
     private func promote(_ window: AXWindow) {
-        guard var session = focus, session.widgetsReady, window.id != session.main.id else { return }
+        guard var session = focus, session.cardsReady, window.id != session.main.id else { return }
         let entry = entries.first { $0.window.id == window.id }
         guard let size = entry?.size ?? window.size else { return }
         if let entry {
@@ -756,35 +736,35 @@ final class WindowManager {
             entry.wantsParked = false
             entry.capture.onStopped = nil
             entries.removeAll { $0 === entry }
-            layOutWidgets()
-            // The preview stays up until the real window has had time to redraw underneath it.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                entry.preview.close()
-                entry.capture.stop()
-            }
+            layOutCards()
+            closeAfterRedraw(entry)
         }
         window.setFrame(wasFullView ? session.visible : target)
         window.raise()
 
-        // A native full-screen window lives in its own Space and can't be parked, so it stays there.
+        // A native full-screen window can't be parked.
         if let oldFrame, !old.isFullScreen, !entries.contains(where: { $0.window.id == old.id }) {
             let capture = WindowCapture(windowID: old.id, size: oldFrame.size)
-            capture.setQuality(.widget)
+            capture.setQuality(.card)
             capture.start()
-            dockWhenReady([PendingWidget(window: old, frame: oldFrame, capture: capture, preferredEdge: preferredEdge)],
+            dockWhenReady([PendingCard(window: old, frame: oldFrame, capture: capture, preferredEdge: preferredEdge)],
                           sessionID: session.id, started: ProcessInfo.processInfo.systemUptime,
                           deadline: Date().addingTimeInterval(3))
         }
         updateCoveredColumns()
     }
 
-    private func focusedTarget(size: CGSize, visible: CGRect, alsoReserving edge: Edge?) -> CGRect {
+    /// The horizontal space left between the edge columns.
+    private func focusAreaBounds(in visible: CGRect, alsoReserving edge: Edge? = nil) -> (minX: CGFloat, maxX: CGFloat) {
         let docked = entries.filter { $0.dockEdge != nil && $0.dockScreenFrame == visible }
-        let reserved = widgetWidth + 2 * widgetMargin
+        let reserved = cardWidth + 2 * cardMargin
         let reservesLeft = edge == .left || docked.contains { $0.dockEdge == .left }
         let reservesRight = edge == .right || docked.contains { $0.dockEdge == .right }
-        let minX = visible.minX + (reservesLeft ? reserved : 0)
-        let maxX = visible.maxX - (reservesRight ? reserved : 0)
+        return (visible.minX + (reservesLeft ? reserved : 0), visible.maxX - (reservesRight ? reserved : 0))
+    }
+
+    private func focusedTarget(size: CGSize, visible: CGRect, alsoReserving edge: Edge?) -> CGRect {
+        let (minX, maxX) = focusAreaBounds(in: visible, alsoReserving: edge)
         let width = min(size.width, maxX - minX)
         let height = min(size.height, visible.height)
         return CGRect(x: minX + (maxX - minX - width) / 2, y: visible.minY + (visible.height - height) / 2,
@@ -799,9 +779,9 @@ final class WindowManager {
         return known + docked.reversed().filter { entry in !recent.contains(entry.window.id) }
     }
 
-    /// ⌥Tab: the first press selects the last window used, and more presses step further back.
+    /// Selects the last window used, or steps further back if ⌥ is still held.
     func switcherPressed() {
-        guard focus?.widgetsReady == true, canSwitchNow else { return }
+        guard focus?.cardsReady == true, canSwitchNow else { return }
         if var active = switcher {
             active.index = (active.index + 1) % active.candidates.count
             switcher = active
@@ -810,7 +790,7 @@ final class WindowManager {
         }
         let candidates = switcherCandidates()
         guard let first = candidates.first else { return }
-        // A hot key has no release event, so the ⌥ key has to be watched directly.
+        // Hot keys have no release event, so ⌥ is polled.
         let timer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self] _ in
             if !CGEventSource.flagsState(.combinedSessionState).contains(.maskAlternate) { self?.finishSwitcher() }
         }
@@ -837,13 +817,12 @@ final class WindowManager {
             revealedColumn = nil
             applyVisibility(of: [revealed])
         }
-        // The window may have closed while its card was selected.
         if entries.contains(where: { $0 === chosen }) { promote(chosen.window) }
     }
 
     // MARK: Focus mode
 
-    /// The shortcut: starts focus mode if needed, then switches the main window between focused and full view.
+    /// Starts focus mode if needed, otherwise switches between focused and full view.
     func toggleFullView() {
         guard var session = focus else {
             guard let app = NSWorkspace.shared.frontmostApplication,
@@ -869,7 +848,6 @@ final class WindowManager {
             session.main.raise()
             Log.write("view: \(session.main.appName) full view")
         }
-        // Right away, rather than at the next tick, so the columns move together with the window.
         updateCoveredColumns()
     }
 
@@ -897,24 +875,23 @@ final class WindowManager {
         Log.write("focus: starting with \(main.appName), \(others.count) other window(s)")
 
         let listing = WindowCapture.listWindows()
-        // Frontmost first, which is reversed when docking: the frontmost window becomes the top card.
-        let pending = others.reversed().map { other -> PendingWidget in
+        // Reversed so the frontmost window ends up as the top card.
+        let pending = others.reversed().map { other -> PendingCard in
             let capture = WindowCapture(windowID: other.window.id, size: other.frame.size)
-            capture.setQuality(.widget)
+            capture.setQuality(.card)
             capture.start(listing: listing)
             focus?.remember(other.window, frame: other.frame)
-            return PendingWidget(window: other.window, frame: other.frame, capture: capture)
+            return PendingCard(window: other.window, frame: other.frame, capture: capture)
         }
-        // Last, so that a restore raises it after all the others and it's on top again.
+        // Remembered last so it's raised last on restore.
         focus?.remember(main, frame: originalFrame)
         Log.write("focus: waiting for \(pending.count) preview(s)")
         dockWhenReady(pending, sessionID: session.id,
                       started: ProcessInfo.processInfo.systemUptime, deadline: Date().addingTimeInterval(3))
     }
 
-    /// A window is only hidden once its preview has a picture, so nothing blinks out of existence.
-    /// Windows dock as their pictures arrive, so slow ones don't hold up the rest.
-    private func dockWhenReady(_ pending: [PendingWidget], sessionID: UUID, started: TimeInterval, deadline: Date) {
+    /// Docks each window once its preview has a first frame.
+    private func dockWhenReady(_ pending: [PendingCard], sessionID: UUID, started: TimeInterval, deadline: Date) {
         guard let session = focus, session.id == sessionID else {
             pending.forEach { $0.capture.stop() }
             return
@@ -923,7 +900,7 @@ final class WindowManager {
         let ready = pending.filter { $0.capture.hasFrame }
         let waiting = pending.filter { !$0.capture.hasFrame }
         for item in ready {
-            // With quick switching, it may be back in the focus area already.
+            // Quick switching may have promoted it again already.
             if item.window.id == focus?.main.id {
                 item.capture.stop()
                 continue
@@ -933,7 +910,6 @@ final class WindowManager {
             entries.append(entry)
             entry.preview.setFrame(item.frame)
             entry.preview.show()
-            // A window keeps its side across switches, so it can be found in the same place.
             let edge = session.edges[item.window.id] ?? item.preferredEdge
                 ?? (item.frame.midX < visible.midX ? .left : .right)
             focus?.edges[item.window.id] = edge
@@ -941,8 +917,8 @@ final class WindowManager {
             park(entry, attempt: 1, started: started)
         }
         if !ready.isEmpty {
-            layOutWidgets()
-            focus?.widgetsReady = true
+            layOutCards()
+            focus?.cardsReady = true
             settleMainWindow()
         }
         if waiting.isEmpty || Date() >= deadline {
@@ -951,8 +927,8 @@ final class WindowManager {
                 Log.write("focus: no preview for \(item.window.appName), leaving its window alone")
             }
             let elapsed = Int((ProcessInfo.processInfo.systemUptime - started) * 1000)
-            Log.write("focus: widgets done in \(elapsed) ms, \(waiting.count) window(s) left out")
-            focus?.widgetsReady = true
+            Log.write("focus: cards done in \(elapsed) ms, \(waiting.count) window(s) left out")
+            focus?.cardsReady = true
             focus?.initialDockingDone = true
             settleMainWindow()
             return
@@ -982,13 +958,13 @@ final class WindowManager {
             entry.preview.setFrame(home, animated: true)
         }
         entries.removeAll { entry in returning.contains { $0 === entry } }
-        layOutWidgets()
+        layOutCards()
         if let frame = session.originalFrame(of: session.main.id) {
             pendingMainRestore = (session.main, frame)
         }
         let others = session.originals.filter { $0.window.id != session.main.id }
 
-        // Previews fly home first, then the real windows take their place, oldest first to keep their order.
+        // Previews animate home first, then the real windows replace them in their original order.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             for other in others {
                 other.window.setFrame(other.frame)
@@ -1005,7 +981,7 @@ final class WindowManager {
         settleMainWindow()
     }
 
-    /// Applies the main window's move or resize, once the user is no longer dragging it.
+    /// Moves or resizes the main window, unless it's being dragged.
     private func settleMainWindow() {
         if case .nativeDrag = phase { return }
         if let restore = pendingMainRestore {
@@ -1013,7 +989,7 @@ final class WindowManager {
             restore.window.setFrame(restore.frame)
             Log.write("focus: main window back at \(restore.frame)")
         }
-        guard let session = focus, session.widgetsReady, session.frameBeforeFullView == nil,
+        guard let session = focus, session.cardsReady, session.frameBeforeFullView == nil,
               let frame = session.main.frame,
               let screen = Screens.screen(at: CGPoint(x: frame.midX, y: frame.midY)) else { return }
 
@@ -1024,10 +1000,7 @@ final class WindowManager {
             Log.write("focus: centered \(session.main.appName) at \(session.main.frame ?? .zero)")
             return
         }
-        let docked = entries.filter { $0.dockEdge != nil && $0.dockScreenFrame == visible }
-        let reserved = widgetWidth + 2 * widgetMargin
-        let minX = visible.minX + (docked.contains { $0.dockEdge == .left } ? reserved : 0)
-        let maxX = visible.maxX - (docked.contains { $0.dockEdge == .right } ? reserved : 0)
+        let (minX, maxX) = focusAreaBounds(in: visible)
 
         var fitted = frame
         fitted.size.width = min(frame.width, maxX - minX)
@@ -1056,7 +1029,7 @@ final class WindowManager {
         }
     }
 
-    /// If a previous run crashed, its windows are still parked in the corner. Bring them back.
+    /// Recovers windows left parked by a crash.
     private func rescueParkedWindows() {
         for window in AXWindow.allOnScreen() {
             guard let frame = window.frame, Screens.isParked(frame.origin),

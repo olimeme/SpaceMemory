@@ -1,12 +1,6 @@
 import AppKit
 import ApplicationServices
 
-/// Launch flags: --check-windows App1,App2 and --check-gestures App1,App2 run the automated
-/// feasibility checks, --check-fullview App exercises full view and native full screen,
-/// --check-dropped-card exercises docking with a large window in front,
-/// --check-drag Source,Target exercises dragging content between windows,
-/// --check-switching App exercises the one-window focus area,
-/// --check-shortcut set|verify exercises changing the shortcut, and --quit-after-checks exits when they finish.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let manager = WindowManager()
     private let shortcut = ShortcutController()
@@ -27,7 +21,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         waitForPermissions()
     }
 
-    /// Two copies would both act on every mouse event and fight over the same windows.
     private func quitOtherCopies() {
         guard let bundleID = Bundle.main.bundleIdentifier else { return }
         let ownPID = ProcessInfo.processInfo.processIdentifier
@@ -73,26 +66,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
             return args[i + 1].split(separator: ",").map(String.init)
         }
-        let windowApps = names(after: "--check-windows")
         let gestureApps = names(after: "--check-gestures")
         let fullViewApps = names(after: "--check-fullview")
         let shortcutPhase = names(after: "--check-shortcut")?.first
         let switchingApps = names(after: "--check-switching")
         let dragApps = names(after: "--check-drag")
         let checksDroppedCard = args.contains("--check-dropped-card")
-        guard windowApps != nil || gestureApps != nil || fullViewApps != nil || shortcutPhase != nil
+        guard gestureApps != nil || fullViewApps != nil || shortcutPhase != nil
                 || switchingApps != nil || dragApps != nil || checksDroppedCard else { return }
         Task { @MainActor in
-            if let windowApps { await Probe.runWindowChecks(appNames: windowApps) }
-            if let gestureApps { await Probe.runGestureChecks(manager: manager, appNames: gestureApps) }
-            if let fullViewApps { await Probe.runFullViewChecks(manager: manager, appNames: fullViewApps) }
-            if let switchingApps { await Probe.runSwitchingChecks(manager: manager, appNames: switchingApps) }
-            if checksDroppedCard { await Probe.runDroppedCardChecks(manager: manager) }
-            if let dragApps { await Probe.runContentDragChecks(manager: manager, appNames: dragApps) }
+            if let gestureApps { await Checks.runGestureChecks(manager: manager, appNames: gestureApps) }
+            if let fullViewApps { await Checks.runFullViewChecks(manager: manager, appNames: fullViewApps) }
+            if let switchingApps { await Checks.runSwitchingChecks(manager: manager, appNames: switchingApps) }
+            if checksDroppedCard { await Checks.runDroppedCardChecks(manager: manager) }
+            if let dragApps { await Checks.runContentDragChecks(manager: manager, appNames: dragApps) }
             if let shortcutPhase {
-                // Key presses only: the toggle would move windows, and this check is about the shortcut.
+                // Stops the shortcut from moving windows during this check.
                 shortcut.onPressed = nil
-                await Probe.runShortcutChecks(controller: shortcut, phase: shortcutPhase)
+                await Checks.runShortcutChecks(controller: shortcut, phase: shortcutPhase)
             }
             if args.contains("--quit-after-checks") { NSApp.terminate(nil) }
         }

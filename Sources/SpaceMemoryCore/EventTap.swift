@@ -1,9 +1,9 @@
 import AppKit
 
-/// Watches the left mouse button system-wide and can swallow it while a preview is being dragged.
-/// Runs on its own thread so that a slow app or busy main thread can never stall the user's mouse.
+/// Watches the left mouse button system-wide and can swallow its events.
+/// Runs on its own thread so a busy main thread can't stall the mouse.
 final class EventTap {
-    enum Kind { case down, widgetDown, dragged, up, moved }
+    enum Kind { case down, cardDown, dragged, up, moved }
 
     private static let syntheticMarker: Int64 = 0x53504D45
 
@@ -11,16 +11,15 @@ final class EventTap {
 
     private let lock = NSLock()
     private var suppressing = false
-    private var widgetFrames: [CGRect] = []
-    private var cursorWasOverWidget = false
+    private var cardFrames: [CGRect] = []
+    private var cursorWasOverCard = false
     private var machPort: CFMachPort?
 
-    func setWidgetFrames(_ frames: [CGRect]) {
-        lock.withLock { widgetFrames = frames }
+    func setCardFrames(_ frames: [CGRect]) {
+        lock.withLock { cardFrames = frames }
     }
 
-    /// Ends the app's native window drag. From here until the real button release, the mouse events
-    /// are hidden from apps, and the rest of the gesture is ours.
+    /// Ends the app's native window drag, and hides mouse events from apps until the button is released.
     func takeOverDrag(at point: CGPoint) {
         lock.withLock { suppressing = true }
         guard let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp,
@@ -69,11 +68,11 @@ final class EventTap {
         let time = ProcessInfo.processInfo.systemUptime
 
         if type == .mouseMoved {
-            // Moves are constant, so the main thread only hears about those that touch a widget.
+            // Only moves over a card are forwarded to the main thread.
             lock.lock()
-            let isOverWidget = widgetFrames.contains { $0.contains(point) }
-            let shouldReport = isOverWidget || cursorWasOverWidget
-            cursorWasOverWidget = isOverWidget
+            let isOverCard = cardFrames.contains { $0.contains(point) }
+            let shouldReport = isOverCard || cursorWasOverCard
+            cursorWasOverCard = isOverCard
             lock.unlock()
             if shouldReport {
                 DispatchQueue.main.async { [weak self] in self?.onEvent?(.moved, point, time) }
@@ -87,12 +86,12 @@ final class EventTap {
         lock.lock()
         switch type {
         case .leftMouseDown:
-            if widgetFrames.contains(where: { $0.contains(point) }) {
+            if cardFrames.contains(where: { $0.contains(point) }) {
                 suppressing = true
                 swallow = true
-                kind = .widgetDown
+                kind = .cardDown
             } else {
-                // A new press always clears any stale state, so a click can never get lost for good.
+                // Clears any stale state.
                 suppressing = false
                 kind = .down
             }

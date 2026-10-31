@@ -1,13 +1,13 @@
 import AppKit
 import ScreenCaptureKit
 
-/// Automated feasibility checks. Both modes move real windows for a few seconds and put them back.
-enum Probe {
+/// Automated checks using simulated input. They move real windows, then put them back.
+enum Checks {
     private static let outputDirectory = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Logs/SpaceMemory-probe")
+        .appendingPathComponent("Library/Logs/SpaceMemory-checks")
 
     private static func report(_ line: String) {
-        Log.write("probe: \(line)")
+        Log.write("check: \(line)")
     }
 
     private static func findWindow(appName: String) -> AXWindow? {
@@ -37,79 +37,28 @@ enum Probe {
         return url.path
     }
 
+    /// By title, for checks that press inside a window and must not touch the user's own.
+    private static func titled(_ appName: String, _ title: String) -> AXWindow? {
+        NSWorkspace.shared.runningApplications
+            .filter { ($0.localizedName ?? "").localizedCaseInsensitiveContains(appName) }
+            .flatMap { AXWindow.windows(ofPID: $0.processIdentifier) }
+            .first { $0.isStandard && $0.title.localizedCaseInsensitiveContains(title) }
+    }
+
+    private static func notRestored(_ before: [(AXWindow, CGRect)]) -> [String] {
+        before.filter { window, frame in
+            guard let now = window.frame else { return false }
+            return abs(now.minX - frame.minX) > 2 || abs(now.minY - frame.minY) > 2
+                || abs(now.width - frame.width) > 2 || abs(now.height - frame.height) > 2
+        }.map { "\($0.0.appName) \($0.1)" }
+    }
+
     private static func sameImage(_ a: CGImage?, _ b: CGImage?) -> Bool {
         guard let a, let b, let dataA = a.dataProvider?.data, let dataB = b.dataProvider?.data else { return false }
         return CFEqual(dataA, dataB)
     }
 
-    // MARK: Capture and control checks, no mouse involved
-
-    @MainActor
-    static func runWindowChecks(appNames: [String]) async {
-        report("=== window checks ===")
-        for name in appNames {
-            guard let window = findWindow(appName: name), let frame = window.frame else {
-                report("[\(name)] no usable window found")
-                continue
-            }
-            report("[\(name)] window \(window.id) frame \(frame)")
-
-            var timings: [Double] = []
-            for offset in 1...20 {
-                let start = ProcessInfo.processInfo.systemUptime
-                window.setOrigin(CGPoint(x: frame.minX + CGFloat(offset % 2), y: frame.minY))
-                timings.append((ProcessInfo.processInfo.systemUptime - start) * 1000)
-            }
-            window.setOrigin(frame.origin)
-            let mean = timings.reduce(0, +) / Double(timings.count)
-            report("[\(name)] move call: mean \(String(format: "%.1f", mean)) ms, worst \(String(format: "%.1f", timings.max() ?? 0)) ms")
-
-            window.setSize(CGSize(width: 240, height: 160))
-            await sleep(0.3)
-            report("[\(name)] asked for 240x160, got \(window.size ?? .zero)")
-            window.setSize(frame.size)
-            window.setOrigin(frame.origin)
-            await sleep(0.3)
-
-            let capture = WindowCapture(windowID: window.id, size: frame.size)
-            let started = ProcessInfo.processInfo.systemUptime
-            capture.start()
-            while !capture.hasFrame && ProcessInfo.processInfo.systemUptime - started < 3 { await sleep(0.01) }
-            report("[\(name)] first frame after \(Int((ProcessInfo.processInfo.systemUptime - started) * 1000)) ms: \(capture.hasFrame)")
-
-            let beforeVisible = capture.frameCount
-            await sleep(3)
-            report("[\(name)] frames in 3 s while visible: \(capture.frameCount - beforeVisible)")
-            report("[\(name)] visible image: \(savePNG(await capture.screenshot(), name: "\(name)-visible"))")
-
-            window.setOrigin(Screens.parkingOrigin)
-            await sleep(0.5)
-            let parkedOrigin = window.origin ?? .zero
-            report("[\(name)] parked at \(parkedOrigin), wanted \(Screens.parkingOrigin), ok: \(Screens.isParked(parkedOrigin))")
-
-            let beforeParked = capture.frameCount
-            await sleep(3)
-            report("[\(name)] frames in 3 s while parked: \(capture.frameCount - beforeParked)")
-            report("[\(name)] parked screenshot: \(savePNG(await capture.screenshot(), name: "\(name)-parked-screenshot"))")
-            report("[\(name)] parked stream content rect: \(capture.lastContentRect)")
-            let firstFrame = capture.latestFrameImage()
-            report("[\(name)] parked stream frame: \(savePNG(firstFrame, name: "\(name)-parked-stream-1"))")
-            await sleep(1.5)
-            let secondFrame = capture.latestFrameImage()
-            report("[\(name)] parked stream frame: \(savePNG(secondFrame, name: "\(name)-parked-stream-2"))")
-            report("[\(name)] parked stream content changed: \(!sameImage(firstFrame, secondFrame))")
-
-            capture.stop()
-            window.setOrigin(frame.origin)
-            await sleep(0.3)
-            let restored = window.frame == frame
-            report("[\(name)] restored exactly: \(restored) (\(window.frame ?? .zero))")
-            await sleep(0.3)
-        }
-        report("=== window checks done ===")
-    }
-
-    // MARK: End-to-end gestures, with synthetic mouse input through the real event tap
+    // MARK: Input
 
     private static func post(_ type: CGEventType, _ point: CGPoint) {
         CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: .left)?
@@ -124,7 +73,7 @@ enum Probe {
         }
     }
 
-    /// A press point in the title-bar area that is empty in most apps.
+    /// A title-bar point that's empty in most apps.
     private static func titleBarPoint(of frame: CGRect) -> CGPoint {
         CGPoint(x: frame.minX + frame.width * 0.82, y: frame.minY + 8)
     }
@@ -143,6 +92,10 @@ enum Probe {
             let zones = Zones(screen: screen)
             let start = titleBarPoint(of: frame)
             let beforeDocked = manager.dockedCount
+            guard AXWindow.at(start)?.id == window.id else {
+                report("[\(name)] FAILED: window isn't under the press point")
+                continue
+            }
 
             post(.mouseMoved, start)
             await sleep(0.1)
@@ -154,7 +107,7 @@ enum Probe {
             await drag(CGPoint(x: start.x + 60, y: start.y), to: dockPoint, steps: 70)
             await sleep(0.1)
             post(.leftMouseUp, dockPoint)
-            // Soon after release, well inside what an animation would take: the card must already be in place.
+            // Too soon for an animation to have finished.
             await sleep(0.05)
             if let card = manager.entries.first(where: { $0.window.id == window.id }) {
                 let onScreen = card.preview.panel.frame
@@ -171,12 +124,12 @@ enum Probe {
                 window.setOrigin(frame.origin)
                 continue
             }
-            report("[\(name)] widget frame \(entry.preview.frame)")
+            report("[\(name)] card frame \(entry.preview.frame)")
             report("[\(name)] docked image: \(savePNG(await desktopSnapshot(), name: "\(name)-docked-desktop"))")
 
             let framesBefore = entry.capture.frameCount
             await sleep(2)
-            report("[\(name)] widget frames in 2 s: \(entry.capture.frameCount - framesBefore)")
+            report("[\(name)] card frames in 2 s: \(entry.capture.frameCount - framesBefore)")
 
             // A large window in front covers the column, and then the card has to be revealed first.
             if manager.hiddenColumnCount > 0 {
@@ -185,16 +138,15 @@ enum Probe {
                 await sleep(0.9)
                 report("[\(name)] revealed \(manager.isColumnRevealed)")
             }
-            let widget = CGPoint(x: entry.slotFrame.midX, y: entry.slotFrame.midY)
-            post(.mouseMoved, widget)
+            let card = CGPoint(x: entry.slotFrame.midX, y: entry.slotFrame.midY)
+            post(.mouseMoved, card)
             await sleep(0.1)
-            post(.leftMouseDown, widget)
+            post(.leftMouseDown, card)
             await sleep(0.05)
-            post(.leftMouseUp, widget)
+            post(.leftMouseUp, card)
             await sleep(0.6)
             let after = window.frame ?? .zero
-            report("[\(name)] click widget: restored to original \(after == frame) (\(after))")
-            // The rest presses at the window's title bar, which must not land in some other window.
+            report("[\(name)] click card: restored to original \(after == frame) (\(after))")
             guard AXWindow.at(start)?.id == window.id else {
                 report("[\(name)] FAILED: window isn't under the press point, skipping its remaining gestures")
                 window.setOrigin(frame.origin)
@@ -270,16 +222,12 @@ enum Probe {
     }
 
     private static func pressShortcut() {
-        for isDown in [true, false] {
-            let event = CGEvent(keyboardEventSource: nil, virtualKey: 3, keyDown: isDown) // 3 is the F key
-            event?.flags = [.maskControl, .maskAlternate, .maskCommand]
-            event?.post(tap: .cghidEventTap)
-        }
+        press(3, [.maskControl, .maskAlternate, .maskCommand]) // 3 is the F key
     }
 
-    // MARK: One window in the focus area
+    // MARK: Switching
 
-    /// Keys go to whichever app is in front, so app shortcuts are only sent to the expected app.
+    /// Only sends app shortcuts to the expected app.
     private static func pressIfFront(_ appName: String, _ key: CGKeyCode, _ flags: CGEventFlags) -> Bool {
         guard NSWorkspace.shared.frontmostApplication?.localizedName == appName else {
             report("[switch] skipped a key press: \(appName) wasn't in front")
@@ -295,7 +243,6 @@ enum Probe {
         event?.post(tap: .cghidEventTap)
     }
 
-    /// Reports anything breaking the rule: exactly one real window in the focus area, nothing over it.
     @MainActor
     private static func reportFocusArea(_ manager: WindowManager, _ step: String) {
         guard let main = manager.focusedMainWindow, let frame = main.frame else {
@@ -310,7 +257,7 @@ enum Probe {
         let managed = Set(manager.entries.map(\.window.id))
         let overlapping = manager.entries.filter { $0.dockEdge != nil && $0.preview.frame.intersects(frame) }.count
         let front = NSWorkspace.shared.frontmostApplication.flatMap { AXWindow.focused(ofPID: $0.processIdentifier) }
-        report("[switch] \(step): main \(main.appName) \(main.id) \(frame), has focus \(front?.id == main.id), main is a card \(managed.contains(main.id)), other windows visible \(others.map(\.appName)), widgets over it \(overlapping), widgets \(manager.dockedCount)")
+        report("[switch] \(step): main \(main.appName) \(main.id) \(frame), has focus \(front?.id == main.id), main is a card \(managed.contains(main.id)), other windows visible \(others.map(\.appName)), cards over it \(overlapping), cards \(manager.dockedCount)")
     }
 
     @MainActor
@@ -374,7 +321,7 @@ enum Probe {
         await sleep(0.15)
         postModifier(58, down: false, flags: [])
         await sleep(1.2)
-        report("[switch] ⌥Tab tapped: back to the last window \(manager.focusedMainWindow?.id == leftWindow || manager.focusedMainWindow?.id != secondChoice)")
+        report("[switch] ⌥Tab tapped: back to the last window \(manager.focusedMainWindow?.id == leftWindow)")
         reportFocusArea(manager, "⌥Tab tapped")
 
         // Windows of one app: ⌘` switches without activating anything.
@@ -417,7 +364,7 @@ enum Probe {
         reportFocusArea(manager, "back to focused")
         if let fullFirst { NSRunningApplication(processIdentifier: fullFirst.pid)?.activate() }
         await sleep(1.2)
-        report("[switch] returning window size kept: \(manager.focusedMainWindow?.id != fullFirst?.id || manager.focusedMainWindow?.size == focusedSize)")
+        report("[switch] returning window: same window \(manager.focusedMainWindow?.id == fullFirst?.id), same size \(manager.focusedMainWindow?.size == focusedSize)")
 
         // A window that's just been opened.
         findWindow(appName: appNames[0]).flatMap { NSRunningApplication(processIdentifier: $0.pid) }?.activate()
@@ -440,27 +387,15 @@ enum Probe {
 
         manager.exitFocus()
         await sleep(1.2)
-        let wrong = before.filter { window, frame in
-            guard let now = window.frame else { return false }
-            return abs(now.minX - frame.minX) > 2 || abs(now.minY - frame.minY) > 2
-                || abs(now.width - frame.width) > 2 || abs(now.height - frame.height) > 2
-        }
-        report("[switch] exit: focus \(manager.isFocusMode), widgets \(manager.entries.count), windows checked \(before.count), not back in place \(wrong.map { "\($0.0.appName) \($0.1) now \($0.0.frame ?? .zero)" })")
+        report("[switch] exit: focus \(manager.isFocusMode), cards \(manager.entries.count), windows checked \(before.count), not back in place \(notRestored(before))")
         report("=== switching checks done ===")
     }
 
     // MARK: A dropped card and a large window
 
-    /// Uses only windows opened for the test: a Chrome page by title, sized to fill the screen, and TextEdit.
     @MainActor
     static func runDroppedCardChecks(manager: WindowManager) async {
         report("=== dropped card checks ===")
-        func titled(_ appName: String, _ title: String) -> AXWindow? {
-            NSWorkspace.shared.runningApplications
-                .filter { ($0.localizedName ?? "").localizedCaseInsensitiveContains(appName) }
-                .flatMap { AXWindow.windows(ofPID: $0.processIdentifier) }
-                .first { $0.isStandard && $0.title.localizedCaseInsensitiveContains(title) }
-        }
         guard let large = titled("Chrome", "SpaceMemory drag test"), let window = titled("TextEdit", "snap-test"),
               let screen = NSScreen.main else {
             report("[dropped] FAILED: test windows not found")
@@ -531,13 +466,6 @@ enum Probe {
     @MainActor
     static func runContentDragChecks(manager: WindowManager, appNames: [String]) async {
         report("=== content drag checks ===")
-        // By title, because this presses inside the window: it must never be one of the user's own.
-        func titled(_ appName: String, _ title: String) -> AXWindow? {
-            NSWorkspace.shared.runningApplications
-                .filter { ($0.localizedName ?? "").localizedCaseInsensitiveContains(appName) }
-                .flatMap { AXWindow.windows(ofPID: $0.processIdentifier) }
-                .first { $0.isStandard && $0.title.localizedCaseInsensitiveContains(title) }
-        }
         guard appNames.count >= 2, let source = titled(appNames[0], "SpaceMemory drag test"),
               let target = titled(appNames[1], "drag-target"), let sourceFrame = source.frame else {
             report("[drag] FAILED: test windows not found")
@@ -640,12 +568,7 @@ enum Probe {
 
         manager.exitFocus()
         await sleep(1.2)
-        let wrong = before.filter { window, frame in
-            guard let now = window.frame else { return false }
-            return abs(now.minX - frame.minX) > 2 || abs(now.minY - frame.minY) > 2
-                || abs(now.width - frame.width) > 2 || abs(now.height - frame.height) > 2
-        }
-        report("[drag] exit: focus \(manager.isFocusMode), windows checked \(before.count), not back in place \(wrong.map { $0.0.appName })")
+        report("[drag] exit: focus \(manager.isFocusMode), windows checked \(before.count), not back in place \(notRestored(before))")
         report("=== content drag checks done ===")
     }
 
@@ -659,7 +582,7 @@ enum Probe {
         }
     }
 
-    /// "set" changes the shortcut and leaves it; "verify", in a new launch, checks it survived and resets it.
+    /// "set" changes the shortcut. "verify", in a new launch, checks that it was saved and resets it.
     @MainActor
     static func runShortcutChecks(controller: ShortcutController, phase: String) async {
         report("=== shortcut checks: \(phase) ===")
@@ -738,9 +661,9 @@ enum Probe {
         pressShortcut()
         await sleep(4)
         let focusedFrame = window.frame ?? .zero
-        report("[view] shortcut from normal: focus \(manager.isFocusMode), full view \(manager.isFullView), widgets \(manager.dockedCount)")
+        report("[view] shortcut from normal: focus \(manager.isFocusMode), full view \(manager.isFullView), cards \(manager.dockedCount)")
         let overlap = manager.entries.filter { $0.dockEdge != nil && $0.preview.frame.intersects(focusedFrame) }.count
-        report("[view] focused \(focusedFrame), hidden columns \(manager.hiddenColumnCount), widgets overlapping \(overlap)")
+        report("[view] focused \(focusedFrame), hidden columns \(manager.hiddenColumnCount), cards overlapping \(overlap)")
         report("[view] focused image: \(savePNG(await desktopSnapshot(), name: "view-focused"))")
 
         pressShortcut()
@@ -766,7 +689,7 @@ enum Probe {
         await sleep(1)
         let backFrame = window.frame ?? .zero
         let overlapAfter = manager.entries.filter { $0.dockEdge != nil && $0.preview.frame.intersects(backFrame) }.count
-        report("[view] shortcut back: full view \(manager.isFullView), same frame as focused \(backFrame == focusedFrame), hidden columns \(manager.hiddenColumnCount), widgets overlapping \(overlapAfter)")
+        report("[view] shortcut back: full view \(manager.isFullView), same frame as focused \(backFrame == focusedFrame), hidden columns \(manager.hiddenColumnCount), cards overlapping \(overlapAfter)")
 
         // Native full screen: the window goes to its own Space, away from the parked windows.
         let live = manager.entries.first { $0.window.appName == "Safari" } ?? manager.entries.first
@@ -795,7 +718,7 @@ enum Probe {
             post(.leftMouseUp, point)
             await sleep(2)
             let gone = !manager.entries.contains { $0 === card }
-            report("[native] clicked \(card.window.appName): widget removed \(gone), window at \(card.window.frame ?? .zero), frontmost \(NSWorkspace.shared.frontmostApplication?.localizedName ?? "?")")
+            report("[native] clicked \(card.window.appName): card removed \(gone), window at \(card.window.frame ?? .zero), frontmost \(NSWorkspace.shared.frontmostApplication?.localizedName ?? "?")")
             report("[native] after click image: \(savePNG(await desktopSnapshot(), name: "native-after-click"))")
         }
         window.raise()
@@ -805,22 +728,11 @@ enum Probe {
         report("[native] exited: frame \(window.frame ?? .zero), focus \(manager.isFocusMode), hidden columns \(manager.hiddenColumnCount)")
         report("[native] exited image: \(savePNG(await desktopSnapshot(), name: "native-exited"))")
 
-        // Clicking the card left another window in front, so the title bar may be covered.
         window.raise()
         await sleep(0.6)
         await performShake(window, fallback: frame)
         await sleep(0.5)
-        report("[view] exit shake: focus \(manager.isFocusMode), widgets \(manager.entries.count), main back \(window.frame == frame) (\(window.frame ?? .zero))")
-        if manager.isFocusMode {
-            // Separates "a window just out of full screen ignores drags" from a permanent failure.
-            report("[view] retrying the shake after a pause")
-            await sleep(3)
-            window.raise()
-            await sleep(0.6)
-            await performShake(window, fallback: frame)
-            await sleep(0.5)
-            report("[view] second exit shake: focus \(manager.isFocusMode), widgets \(manager.entries.count), main back \(window.frame == frame) (\(window.frame ?? .zero))")
-        }
+        report("[view] exit shake: focus \(manager.isFocusMode), cards \(manager.entries.count), main back \(window.frame == frame) (\(window.frame ?? .zero))")
         window.setFrame(frame)
         report("=== full view checks done ===")
     }
@@ -837,27 +749,27 @@ enum Probe {
         func shake() async { await performShake(window, fallback: frame) }
 
         await shake()
-        let widgets = manager.entries.filter { $0.dockEdge != nil }
-        report("[focus] active: \(manager.isFocusMode), other windows: \(before.count), widgets: \(widgets.count)")
-        let misplaced = widgets.filter { abs($0.preview.panel.frame.minX - Screens.toAppKit($0.slotFrame).minX) >= 1 }
+        let cards = manager.entries.filter { $0.dockEdge != nil }
+        report("[focus] active: \(manager.isFocusMode), other windows: \(before.count), cards: \(cards.count)")
+        let misplaced = cards.filter { abs($0.preview.panel.frame.minX - Screens.toAppKit($0.slotFrame).minX) >= 1 }
         report("[focus] cards not at their slot: \(misplaced.count)")
         let mainNow = window.frame ?? .zero
-        let overlapping = widgets.filter { $0.preview.frame.intersects(mainNow) }.count
-        report("[focus] main window \(frame) -> \(mainNow), widgets overlapping it: \(overlapping)")
+        let overlapping = cards.filter { $0.preview.frame.intersects(mainNow) }.count
+        report("[focus] main window \(frame) -> \(mainNow), cards overlapping it: \(overlapping)")
         let visible = Screens.screen(at: CGPoint(x: mainNow.midX, y: mainNow.midY)).map { Screens.visibleFrame(of: $0) } ?? .zero
-        report("[focus] widgets outside the screen: \(widgets.filter { !visible.contains($0.preview.frame) }.count)")
-        let parked = widgets.filter { Screens.isParked($0.window.origin ?? .zero) }.count
-        report("[focus] real windows parked: \(parked) of \(widgets.count)")
+        report("[focus] cards outside the screen: \(cards.filter { !visible.contains($0.preview.frame) }.count)")
+        let parked = cards.filter { Screens.isParked($0.window.origin ?? .zero) }.count
+        report("[focus] real windows parked: \(parked) of \(cards.count)")
         for edge in [Edge.left, .right] {
-            let column = widgets.filter { $0.dockEdge == edge }
+            let column = cards.filter { $0.dockEdge == edge }
             let covered = column.filter { $0.hitRect.height < $0.slotFrame.height }.count
             report("[focus] \(edge.rawValue) column: \(column.count) cards, \(covered) overlapped into a deck")
         }
         report("[focus] image: \(savePNG(await desktopSnapshot(), name: "focus-desktop"))")
 
         // Hover and click a card buried in the deck: exactly that card's window must come back.
-        let leftCount = widgets.filter { $0.dockEdge == .left }.count
-        let column = widgets.filter { $0.dockEdge == (leftCount > widgets.count - leftCount ? .left : .right) }
+        let leftCount = cards.filter { $0.dockEdge == .left }.count
+        let column = cards.filter { $0.dockEdge == (leftCount > cards.count - leftCount ? .left : .right) }
         if column.count >= 2 {
             let target = column[column.count / 2]
             let point = CGPoint(x: target.hitRect.midX, y: target.hitRect.midY)
@@ -870,7 +782,7 @@ enum Probe {
             post(.leftMouseUp, point)
             await sleep(0.7)
             let gone = !manager.entries.contains { $0 === target }
-            report("[deck] click card: that window is now the main one \(manager.focusedMainWindow?.id == target.window.id), widget removed \(gone), previous main is a card \(manager.entries.contains { $0.window.id == window.id })")
+            report("[deck] click card: that window is now the main one \(manager.focusedMainWindow?.id == target.window.id), card removed \(gone), previous main is a card \(manager.entries.contains { $0.window.id == window.id })")
         }
 
         // Clicking the card changed which window is in the focus area, so that's the one to shake.
@@ -882,12 +794,11 @@ enum Probe {
         }
         let mainBack = window.frame == frame
         report("[focus] second shake: active \(manager.isFocusMode), others back \(othersBack), main back \(mainBack) (\(window.frame ?? .zero))")
-        report("[focus] widgets left: \(manager.entries.count)")
+        report("[focus] cards left: \(manager.entries.count)")
         report("[focus] restored image: \(savePNG(await desktopSnapshot(), name: "focus-restored-desktop"))")
         window.setFrame(frame)
     }
 
-    /// The whole main display, previews included, to judge what the user would actually see.
     private static func desktopSnapshot() async -> CGImage? {
         guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
               let display = content.displays.first else { return nil }

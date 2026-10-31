@@ -1,7 +1,7 @@
 import CoreGraphics
 import Foundation
 
-/// Spots a shake: several sharp direction changes along one axis within a short time.
+/// Detects several direction changes along one axis within a short time.
 struct ShakeDetector {
     private let minimumTravel: CGFloat = 35
     private let reversalsNeeded = 4
@@ -21,7 +21,6 @@ struct ShakeDetector {
         y = nil
     }
 
-    /// True while the cursor has changed direction recently, so this may still become a shake.
     func mightBeShaking(at time: TimeInterval) -> Bool {
         [x, y].contains { axis in axis?.reversals.contains { time - $0 <= window } ?? false }
     }
@@ -40,7 +39,6 @@ struct ShakeDetector {
     private func update(_ axis: inout Axis, value: CGFloat, time: TimeInterval) -> Bool {
         let delta = value - axis.anchor
         if axis.direction == 0 || delta * axis.direction > 0 {
-            // Still going the same way: follow the furthest point reached.
             if abs(delta) > 0 {
                 axis.direction = delta > 0 ? 1 : -1
                 axis.anchor = value

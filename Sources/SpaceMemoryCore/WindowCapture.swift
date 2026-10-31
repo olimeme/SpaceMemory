@@ -3,7 +3,7 @@ import ScreenCaptureKit
 
 /// A live ScreenCaptureKit feed of one window, drawn into a layer.
 final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
-    enum Quality { case full, widget, deckCard }
+    enum Quality { case full, card, deckCard }
 
     let windowID: CGWindowID
     let size: CGSize
@@ -14,7 +14,6 @@ final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
     var onStopped: (() -> Void)?
 
     private var stream: SCStream?
-    private var scWindow: SCWindow?
     private var quality = Quality.full
     private var stopped = false
     private var latestSample: CMSampleBuffer?
@@ -57,7 +56,6 @@ final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameQueue)
         try await stream.startCapture()
         await MainActor.run {
-            self.scWindow = window
             if self.stopped {
                 stream.stopCapture { _ in }
             } else {
@@ -80,32 +78,21 @@ final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
         stream = nil
     }
 
-    /// The part of the buffer the window actually covers, according to ScreenCaptureKit.
-    private(set) var lastContentRect: CGRect = .zero
-
-    /// The newest frame from the live stream, as opposed to a separate screenshot.
+    /// The newest frame, for the automated checks.
     func latestFrameImage() -> CGImage? {
         guard let buffer = latestSample?.imageBuffer else { return nil }
         let image = CIImage(cvPixelBuffer: buffer)
         return CIContext().createCGImage(image, from: image.extent)
     }
 
-    /// A one-off still of the window, used by the probe to check that parked windows still render.
-    func screenshot() async -> CGImage? {
-        guard let scWindow else { return nil }
-        let filter = SCContentFilter(desktopIndependentWindow: scWindow)
-        return try? await SCScreenshotManager.captureImage(contentFilter: filter,
-                                                           configuration: configuration(for: .full))
-    }
-
     private func configuration(for quality: Quality) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
         let backing = NSScreen.main?.backingScaleFactor ?? 2
-        let pixelScale: CGFloat = quality == .full ? backing : 2 * widgetScale(for: size)
+        let pixelScale: CGFloat = quality == .full ? backing : 2 * cardScale(for: size)
         config.width = max(2, Int(size.width * pixelScale))
         config.height = max(2, Int(size.height * pixelScale))
         config.scalesToFit = true
-        let framesPerSecond: Int32 = quality == .full ? 30 : quality == .widget ? 10 : 2
+        let framesPerSecond: Int32 = quality == .full ? 30 : quality == .card ? 10 : 2
         config.minimumFrameInterval = CMTime(value: 1, timescale: framesPerSecond)
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.queueDepth = 5
@@ -122,13 +109,9 @@ final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
               SCFrameStatus(rawValue: rawStatus) == .complete,
               let pixelBuffer = sampleBuffer.imageBuffer,
               let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() else { return }
-        let contentRectValue = attachments.first?[.contentRect] as? NSDictionary
         DispatchQueue.main.async { [self] in
             frameCount += 1
-            if let contentRectValue {
-                lastContentRect = CGRect(dictionaryRepresentation: contentRectValue) ?? .zero
-            }
-            // Holding the sample stops ScreenCaptureKit recycling the surface while it is on screen.
+            // Retained so ScreenCaptureKit doesn't recycle the surface while it's displayed.
             latestSample = sampleBuffer
             layer.contents = surface
         }
@@ -140,15 +123,14 @@ final class WindowCapture: NSObject, SCStreamDelegate, SCStreamOutput {
     }
 }
 
-/// Refuses dropped content. A card isn't the window it shows, and a drop let through would land on
-/// whatever is behind the card, which may be the desktop.
+/// Refuses drops, which would otherwise land on whatever is behind the card.
 private final class CardView: NSView {
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { [] }
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { [] }
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool { false }
 }
 
-/// A click-through floating panel showing a window's live preview, with an optional header for docked cards.
+/// A floating panel showing a window's live preview.
 final class PreviewPanel {
     let panel: NSPanel
     private let header: NSView
@@ -163,7 +145,6 @@ final class PreviewPanel {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.level = .floating
-        // The event tap handles all input, so the panel never has to take focus from the working window.
         panel.ignoresMouseEvents = true
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle, .fullScreenAuxiliary]
@@ -186,7 +167,6 @@ final class PreviewPanel {
         preview.autoresizingMask = [.width, .height]
         container.addSubview(preview)
 
-        // A shrunken title bar is unreadable, and the top strip is all that shows of a card in a deck.
         header = NSView(frame: CGRect(x: 0, y: initial.height - 24, width: initial.width, height: 24))
         header.wantsLayer = true
         header.layer?.backgroundColor = NSColor(white: 0.1, alpha: 0.92).cgColor
@@ -225,7 +205,7 @@ final class PreviewPanel {
         }
     }
 
-    /// Moves with no animation, and cancels one in progress, which would otherwise finish at its old target.
+    /// Moves immediately, canceling any animation in progress.
     func jump(to rect: CGRect) {
         frame = rect
         NSAnimationContext.runAnimationGroup { context in
@@ -241,7 +221,7 @@ final class PreviewPanel {
     }
 
     func showHeader(_ visible: Bool) { header.isHidden = !visible }
-    /// Only for the length of a content drag: the rest of the time, the event tap handles all input.
+    /// Enabled only during a content drag. The event tap handles all other input.
     func setRefusesDrops(_ refuses: Bool) { panel.ignoresMouseEvents = !refuses }
     func show() { panel.orderFrontRegardless() }
     func close() { panel.orderOut(nil) }

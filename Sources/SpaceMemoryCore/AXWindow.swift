@@ -1,7 +1,7 @@
 import AppKit
 import ApplicationServices
 
-// Private but long-stable; every macOS window manager uses it, as there is no public AX-to-CGWindowID mapping.
+// Private API. There's no public way to get a CGWindowID from an AXUIElement.
 @_silgen_name("_AXUIElementGetWindow")
 private func _AXUIElementGetWindow(_ element: AXUIElement, _ id: UnsafeMutablePointer<CGWindowID>) -> AXError
 
@@ -62,14 +62,13 @@ final class AXWindow {
     }
 
     func setFrame(_ frame: CGRect) {
-        // Moving first makes room for growth at the screen edge; sizing again corrects any clamping.
+        // Set twice because macOS clamps each value against the other near screen edges.
         setOrigin(frame.origin)
         setSize(frame.size)
         setOrigin(frame.origin)
         setSize(frame.size)
     }
 
-    /// Native full screen, which puts the window in its own Space.
     func setFullScreen(_ on: Bool) {
         AXUIElementSetAttributeValue(element, "AXFullScreen" as CFString, (on ? kCFBooleanTrue : kCFBooleanFalse) as CFTypeRef)
     }
@@ -80,7 +79,6 @@ final class AXWindow {
         NSRunningApplication(processIdentifier: pid)?.activate()
     }
 
-    /// Reorders the window without switching the active app.
     func raiseWithoutActivating() {
         AXUIElementPerformAction(element, kAXRaiseAction as CFString)
     }
